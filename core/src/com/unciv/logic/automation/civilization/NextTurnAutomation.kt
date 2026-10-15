@@ -41,6 +41,7 @@ object NextTurnAutomation {
                          tradeAndChangeState: Boolean = true): Unit = timeThis("automateCivMoves") {
         if (civInfo.isBarbarian) return BarbarianAutomation(civInfo).automate()
         if (civInfo.isSpectator()) return // When there's a spectator in multiplayer games, it's processed automatically, but shouldn't be able to actually do anything
+        com.unciv.iaciv.IaCivHooks.onAiTurn(civInfo, tradeAndChangeState) // IA-Civ hook (H1)
 
         val civView = GameView(civInfo.gameInfo, civInfo).civView
 
