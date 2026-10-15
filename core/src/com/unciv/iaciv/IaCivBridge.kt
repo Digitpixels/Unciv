@@ -114,8 +114,11 @@ object IaCivBridge {
         val cfg = config ?: return
         if (cfg.disabled) return
         val gameInfo = civ.gameInfo
+        val faction = cfg.factions[civ.civID]
+        // Session first: the save_written event of the UI-mode save must reach an orchestrator that knows the game folder
+        if (faction != null) ensureSession(gameInfo)
         if (savesInHook) saveTurnOnce(gameInfo)
-        val faction = cfg.factions[civ.civID] ?: return
+        if (faction == null) return
         val orchestrator = client ?: return
         val turn = gameInfo.turns
         val state = civStates.getOrPut(civ.civID) { CivState() }
@@ -123,7 +126,6 @@ object IaCivBridge {
             log.info("T$turn ${civ.civID} : natif (pause après des replis, jusqu'au tour ${state.nativeUntilTurn})")
             return
         }
-        ensureSession(gameInfo)
 
         val observeStart = System.currentTimeMillis()
         val snapshot = CivSnapshot.of(civ)
