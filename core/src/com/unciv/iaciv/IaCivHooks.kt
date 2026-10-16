@@ -58,4 +58,22 @@ object IaCivHooks {
         Log.error("[IA-Civ] H5 failed for ${civInfo.civID}, native settler logic kept", e)
         false
     }
+
+    /**
+     * H2 — wraps the major-civ diplomacy block of `NextTurnAutomation.automateCivMoves` (war, peace, help requests,
+     * friendship, denunciation, embassies, open borders, research agreements, defensive pacts, luxury exchanges,
+     * demands): true = the native AI skips it (religion is kept by the hook's `else`). True for an LLM civ outside a
+     * native pause, unless the orchestrator answered `native.diplomacy = "allowed"` this turn. False when the bridge is
+     * inert, for other civs, and on any error (contract M3 §1: same choice as H5, provisional default).
+     */
+    @JvmStatic
+    fun ownsDiplomacy(civInfo: Civilization): Boolean = try {
+        IaCivBridge.ownsDiplomacy(civInfo)
+    } catch (e: Exception) {
+        Log.error("[IA-Civ] H2 failed for ${civInfo.civID}, native diplomacy kept this turn", e)
+        false
+    } catch (e: LinkageError) {
+        Log.error("[IA-Civ] H2 failed for ${civInfo.civID}, native diplomacy kept this turn", e)
+        false
+    }
 }

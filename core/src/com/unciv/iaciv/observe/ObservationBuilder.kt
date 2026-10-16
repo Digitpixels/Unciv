@@ -1,5 +1,6 @@
 package com.unciv.iaciv.observe
 
+import com.unciv.iaciv.diplomacy.DiplomacyContext
 import com.unciv.iaciv.dto.AlertDto
 import com.unciv.iaciv.dto.CityDto
 import com.unciv.iaciv.dto.CityStateDto
@@ -35,7 +36,7 @@ import kotlin.math.roundToInt
  * state); for other civs we only read what the in-game screens show (diplomacy screen, rankings, wonders overview).
  * Never keeps references to game objects: the result is plain DTOs.
  */
-class ObservationBuilder(private val gameView: GameView) {
+class ObservationBuilder(private val gameView: GameView, private val ctx: DiplomacyContext = DiplomacyContext()) {
     private val civView = gameView.civView
     private val civ: Civilization = civView.getCiv()
     private val ruleset = civ.gameInfo.ruleset
@@ -208,6 +209,12 @@ class ObservationBuilder(private val gameView: GameView) {
                 KnownCityDto(foreignCity.name, foreignCity.getPopulationCount(), distanceToOurBorder(foreignCity.getCenterTile()))
             },
             flags = dm.flagsCountdown.keys.sorted(),
+            atWarSinceTurns = ctx.atWarSince(civ, otherCiv),
+            peacePossibleIn = ctx.peacePossibleIn(civ, otherCiv),
+            weDenounced = dm.hasFlag(DiplomacyFlags.Denunciation),
+            theyDenounced = otherCiv.getDiplomacyManager(civ)?.hasFlag(DiplomacyFlags.Denunciation) == true,
+            friendship = dm.hasFlag(DiplomacyFlags.DeclarationOfFriendship),
+            defensivePact = dm.diplomaticStatus == DiplomaticStatus.DefensivePact || dm.hasFlag(DiplomacyFlags.DefensivePact),
         )
     }
 
@@ -226,6 +233,7 @@ class ObservationBuilder(private val gameView: GameView) {
                 influence = cs.getDiplomacyManager(civ)?.getInfluence()?.roundToInt() ?: 0,
                 ally = cs.allyCiv?.civID?.takeIf { it == civ.civID || civ.knows(it) },
                 type = cs.cityStateType.name,
+                atWar = civ.isAtWarWith(cs),
             )
         }
 

@@ -1,5 +1,6 @@
 package com.unciv.iaciv.orders
 
+import com.unciv.iaciv.diplomacy.DiplomacyContext
 import com.unciv.iaciv.dto.ItemResultDto
 import com.unciv.iaciv.dto.OrderResultDto
 import com.unciv.logic.city.City
@@ -14,46 +15,42 @@ import com.unciv.models.ruleset.unique.UniqueType
 import com.unciv.models.ruleset.unit.BaseUnit
 import com.unciv.models.stats.Stat
 import com.unciv.utils.Log
-import kotlinx.serialization.json.JsonArray
-import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
-import kotlinx.serialization.json.JsonPrimitive
 
 /**
  * Applies the M2 orders (contract §5.3) through Unciv's managers, never through the views' `try*` methods (they
  * require `isCurrentPlayer()`, always false for an AI). Most game functions validate nothing and throw on bad input,
  * so every order is fully validated first; each order runs in its own try/catch and a failure only rejects that order.
  * Never throws. Results come back in the order received; orders are applied by phase (see [PHASES]).
+ * M3: the diplomatic orders are applied by [DiplomacyOrders].
  */
 object OrdersApplier {
 
-    class Outcome(val results: List<OrderResultDto>, val applied: List<AppliedOrder>)
-
-    /** Light control-flow exception for a rejected order (no stack trace) */
-    private class Reject(val reason: String, val detail: String? = null) : RuntimeException(reason) {
-        override fun fillInStackTrace(): Throwable = this
-    }
+    /** [nativeIds] = request and alert ids the orchestrator left to the native AI (`decision: "native"`, contract M3 §2) */
+    class Outcome(val results: List<OrderResultDto>, val applied: List<AppliedOrder>, val nativeIds: Set<String> = setOf())
 
     /** Application order: a free tech may unlock a prerequisite, a policy may unlock buildings, the queue before purchases… */
     private val PHASES = mapOf(
         "choose_free_tech" to 0, "adopt_policy" to 1, "set_research_goal" to 2, "set_research_queue" to 2,
         "disable_construction" to 3, "enable_construction" to 3, "set_production_queue" to 4,
         "purchase" to 5, "set_city_focus" to 6, "noop" to 7,
+        // M3: answers first (a war declaration clears the target's requests), then denunciations and wars, then offers
+        "respond_trade" to 8, "respond_friendship" to 8, "respond_demand" to 8,
+        "denounce" to 9, "declare_war" to 9,
+        "propose_peace" to 10, "offer_friendship" to 10, "propose_trade" to 10, "make_demand" to 10,
     )
     private const val UNKNOWN_PHASE = 99
 
     /** Order types of later milestones (contract §5.3): reported as `ignored` */
-    private val LATER_TYPES = setOf(
-        "declare_war", "propose_peace", "offer_friendship", "respond_friendship", "respond_trade", "propose_trade",
-        "denounce", "respond_demand", "set_posture",
-    )
+    private val LATER_TYPES = setOf("set_posture")
     private val QUEUE_MODES = setOf("replace", "prepend", "append")
     /** = CityConstructions.queueMaxSize (private upstream) */
     private const val QUEUE_MAX_SIZE = 10
     private val IDLE = PerpetualConstruction.Idle.name
 
-    private class Context(val civ: Civilization) {
+    internal class Context(val civ: Civilization, val diplomacy: DiplomacyContext = DiplomacyContext()) {
         val applied = ArrayList<AppliedOrder>()
+        val nativeIds = LinkedHashSet<String>()
         /** Cities whose queue changed: their stats are recomputed once at the end (production bonus depends on it) */
         val touched = LinkedHashSet<City>()
 
@@ -64,15 +61,15 @@ object OrdersApplier {
         }
     }
 
-    fun apply(civ: Civilization, orders: List<JsonObject>): Outcome {
+    fun apply(civ: Civilization, orders: List<JsonObject>, diplomacy: DiplomacyContext = DiplomacyContext()): Outcome {
         val results = arrayOfNulls<OrderResultDto>(orders.size)
-        val context = Context(civ)
+        val context = Context(civ, diplomacy)
         val sorted = orders.withIndex().sortedBy { PHASES[it.value.str("type")] ?: UNKNOWN_PHASE } // stable sort
         for ((index, order) in sorted) {
             val orderId = order.str("order_id") ?: "O-inconnu-$index"
             results[index] = try {
                 applyOne(context, orderId, order)
-            } catch (reject: Reject) {
+            } catch (reject: OrderReject) {
                 OrderResultDto(orderId, "rejected", reject.reason, reject.detail)
             } catch (e: Exception) {
                 Log.error("[IA-Civ] order $orderId failed", e)
@@ -86,7 +83,7 @@ object OrdersApplier {
                 Log.error("[IA-Civ] city stats update failed for ${city.name}", e)
             }
         }
-        return Outcome(results.map { it!! }, context.applied.toList())
+        return Outcome(results.map { it!! }, context.applied.toList(), context.nativeIds.toSet())
     }
 
     private fun applyOne(context: Context, id: String, order: JsonObject): OrderResultDto {
@@ -105,8 +102,9 @@ object OrdersApplier {
             "purchase" -> applied(purchase(context, id, order))
             "disable_construction" -> applied(toggleConstruction(context, id, order.reqStr("name"), disable = true))
             "enable_construction" -> applied(toggleConstruction(context, id, order.reqStr("name"), disable = false))
-            in LATER_TYPES -> OrderResultDto(id, "ignored", "not_implemented", "ordre prévu pour un jalon ultérieur (M3)")
-            else -> throw Reject("unknown_order_type", type)
+            in DiplomacyOrders.TYPES -> DiplomacyOrders.apply(context, id, type, order)
+            in LATER_TYPES -> OrderResultDto(id, "ignored", "not_implemented", "ordre prévu pour un jalon ultérieur (M3b)")
+            else -> throw OrderReject("unknown_order_type", type)
         }
     }
 
@@ -114,11 +112,11 @@ object OrdersApplier {
 
     private fun setResearchGoal(context: Context, id: String, name: String): String {
         val tm = context.civ.tech
-        val tech = context.civ.gameInfo.ruleset.technologies[name] ?: throw Reject("unknown_tech", name)
-        if (tm.isResearched(name) && !tech.isContinuallyResearchable()) throw Reject("tech_already_researched", name)
-        if (tm.isUnresearchable(tech)) throw Reject("tech_not_researchable", name)
+        val tech = context.civ.gameInfo.ruleset.technologies[name] ?: throw OrderReject("unknown_tech", name)
+        if (tm.isResearched(name) && !tech.isContinuallyResearchable()) throw OrderReject("tech_already_researched", name)
+        if (tm.isUnresearchable(tech)) throw OrderReject("tech_not_researchable", name)
         val path = tm.getRequiredTechsToDestination(tech).map { it.name } // prerequisites first, already researched excluded
-        if (path.isEmpty()) throw Reject("tech_not_researchable", "aucun chemin vers $name")
+        if (path.isEmpty()) throw OrderReject("tech_not_researchable", "aucun chemin vers $name")
         tm.techsToResearch = ArrayList(path)
         tm.updateResearchProgress() // may complete the new current tech at once with the overflow science
         context.record(AppliedOrder.Research(id, "set_research_goal", path))
@@ -127,19 +125,19 @@ object OrdersApplier {
 
     /** Exact queue, atomic: `addScience` puts science on `techsToResearch[0]` without checking prerequisites */
     private fun setResearchQueue(context: Context, id: String, names: List<String>): String {
-        if (names.isEmpty()) throw Reject("empty_queue")
+        if (names.isEmpty()) throw OrderReject("empty_queue")
         val tm = context.civ.tech
         val ruleset = context.civ.gameInfo.ruleset
         val known = HashSet(tm.techsResearched)
         val seen = HashSet<String>()
         for (name in names) {
-            val tech = ruleset.technologies[name] ?: throw Reject("unknown_tech", name)
+            val tech = ruleset.technologies[name] ?: throw OrderReject("unknown_tech", name)
             val repeatable = tech.isContinuallyResearchable()
-            if (!repeatable && tm.isResearched(name)) throw Reject("tech_already_researched", name)
-            if (!repeatable && !seen.add(name)) throw Reject("duplicate_tech", name)
-            if (tm.isUnresearchable(tech)) throw Reject("tech_not_researchable", name)
+            if (!repeatable && tm.isResearched(name)) throw OrderReject("tech_already_researched", name)
+            if (!repeatable && !seen.add(name)) throw OrderReject("duplicate_tech", name)
+            if (tm.isUnresearchable(tech)) throw OrderReject("tech_not_researchable", name)
             val missing = tech.prerequisites.filter { it !in known }.sorted()
-            if (missing.isNotEmpty()) throw Reject("prerequisite_gap", "$name exige ${missing.joinToString(", ")}")
+            if (missing.isNotEmpty()) throw OrderReject("prerequisite_gap", "$name exige ${missing.joinToString(", ")}")
             known += name
         }
         tm.techsToResearch = ArrayList(names)
@@ -150,12 +148,12 @@ object OrdersApplier {
 
     private fun chooseFreeTech(context: Context, id: String, name: String): String {
         val tm = context.civ.tech
-        if (tm.freeTechs <= 0) throw Reject("no_free_tech")
-        val tech = context.civ.gameInfo.ruleset.technologies[name] ?: throw Reject("unknown_tech", name)
+        if (tm.freeTechs <= 0) throw OrderReject("no_free_tech")
+        val tech = context.civ.gameInfo.ruleset.technologies[name] ?: throw OrderReject("unknown_tech", name)
         if (!tm.canBeResearched(name)) throw when {
-            tm.isResearched(name) && !tech.isContinuallyResearchable() -> Reject("tech_already_researched", name)
-            tm.isUnresearchable(tech) -> Reject("tech_not_researchable", name)
-            else -> Reject("prerequisite_gap", "$name exige ${tech.prerequisites.filter { !tm.isResearched(it) }.sorted().joinToString(", ")}")
+            tm.isResearched(name) && !tech.isContinuallyResearchable() -> OrderReject("tech_already_researched", name)
+            tm.isUnresearchable(tech) -> OrderReject("tech_not_researchable", name)
+            else -> OrderReject("prerequisite_gap", "$name exige ${tech.prerequisites.filter { !tm.isResearched(it) }.sorted().joinToString(", ")}")
         }
         tm.getFreeTechnology(name) // addTechnology already calls updateResearchProgress
         context.record(AppliedOrder.FreeTech(id, name))
@@ -166,20 +164,20 @@ object OrdersApplier {
     // region policies
 
     private fun adoptPolicy(context: Context, id: String, name: String): String {
-        val policy = context.civ.gameInfo.ruleset.policies[name] ?: throw Reject("unknown_policy", name)
+        val policy = context.civ.gameInfo.ruleset.policies[name] ?: throw OrderReject("unknown_policy", name)
         val pm = context.civ.policies
-        if (pm.isAdopted(name)) throw Reject("policy_already_adopted", name)
+        if (pm.isAdopted(name)) throw OrderReject("policy_already_adopted", name)
         if (!pm.isAdoptable(policy)) {
             val why = when {
                 !pm.getAdoptedPolicies().containsAll(policy.requires ?: emptyList()) -> "exige ${policy.requires?.joinToString(", ")}"
                 !pm.isAdoptable(policy, checkEra = false) -> "exclue par une autre branche ou indisponible"
                 else -> "ère trop précoce (${policy.branch.era})"
             }
-            throw Reject("policy_not_adoptable", "$name : $why")
+            throw OrderReject("policy_not_adoptable", "$name : $why")
         }
         val needed = pm.getCultureNeededForNextPolicy()
-        if (pm.freePolicies == 0 && pm.storedCulture < needed) throw Reject("not_enough_culture", "culture ${pm.storedCulture}/$needed")
-        if (!pm.canAdoptPolicy()) throw Reject("policy_not_adoptable", "$name : aucune politique adoptable maintenant")
+        if (pm.freePolicies == 0 && pm.storedCulture < needed) throw OrderReject("not_enough_culture", "culture ${pm.storedCulture}/$needed")
+        if (!pm.canAdoptPolicy()) throw OrderReject("policy_not_adoptable", "$name : aucune politique adoptable maintenant")
         pm.adopt(policy) // also updates the stats of every city
         context.record(AppliedOrder.Policy(id, name))
         return "$name adoptée, culture restante ${pm.storedCulture}, politiques gratuites ${pm.freePolicies}"
@@ -190,8 +188,8 @@ object OrdersApplier {
 
     private fun ourCity(civ: Civilization, cityId: String): City {
         civ.cities.firstOrNull { it.id == cityId }?.let { return it }
-        if (civ.gameInfo.getCities().any { it.id == cityId }) throw Reject("not_our_city", cityId)
-        throw Reject("unknown_city", cityId)
+        if (civ.gameInfo.getCities().any { it.id == cityId }) throw OrderReject("not_our_city", cityId)
+        throw OrderReject("unknown_city", cityId)
     }
 
     /** Same lookup order as `CityConstructions.getConstruction` (buildings, units, perpetual), without its exception */
@@ -210,9 +208,9 @@ object OrdersApplier {
         val items = order.reqStrList("items")
         val civ = context.civ
         val city = ourCity(civ, cityId)
-        if (city.isPuppet) throw Reject("city_is_puppet", city.name)
-        if (mode !in QUEUE_MODES) throw Reject("invalid_mode", mode)
-        if (items.isEmpty()) throw Reject("empty_items")
+        if (city.isPuppet) throw OrderReject("city_is_puppet", city.name)
+        if (mode !in QUEUE_MODES) throw OrderReject("invalid_mode", mode)
+        if (items.isEmpty()) throw OrderReject("empty_items")
         val cc = city.cityConstructions
         val slots = arrayOfNulls<ItemResultDto>(items.size)
 
@@ -301,10 +299,10 @@ object OrdersApplier {
         val cityId = order.reqStr("city_id")
         val name = order.reqStr("focus")
         val city = ourCity(context.civ, cityId)
-        val focus = CityFocus.entries.firstOrNull { it.name == name } ?: throw Reject("unknown_focus", name)
+        val focus = CityFocus.entries.firstOrNull { it.name == name } ?: throw OrderReject("unknown_focus", name)
         // Manual only freezes the worked tiles of an AI city, and is replaced at the next turn start
-        if (focus == CityFocus.Manual) throw Reject("focus_not_supported", name)
-        if (city.isPuppet) throw Reject("city_is_puppet", "${city.name} : focus Or imposé aux villes fantoches")
+        if (focus == CityFocus.Manual) throw OrderReject("focus_not_supported", name)
+        if (city.isPuppet) throw OrderReject("city_is_puppet", "${city.name} : focus Or imposé aux villes fantoches")
         city.setCityFocus(focus)
         city.reassignPopulation() // = CityView.trySetCityFocus; includes cityStats.update()
         context.record(AppliedOrder.Focus(id, city.id, focus.name))
@@ -320,18 +318,18 @@ object OrdersApplier {
         val stat = when (statName) {
             "Gold" -> Stat.Gold
             "Faith" -> Stat.Faith
-            else -> throw Reject("unknown_stat", statName)
+            else -> throw OrderReject("unknown_stat", statName)
         }
-        val construction = resolve(civ, name) ?: throw Reject("unknown_construction", name)
-        if (construction !is INonPerpetualConstruction) throw Reject("not_purchasable", "$name est une construction perpétuelle")
-        if (name in civ.disabledCityConstructions) throw Reject("construction_disabled", name)
+        val construction = resolve(civ, name) ?: throw OrderReject("unknown_construction", name)
+        if (construction !is INonPerpetualConstruction) throw OrderReject("not_purchasable", "$name est une construction perpétuelle")
+        if (name in civ.disabledCityConstructions) throw OrderReject("construction_disabled", name)
         val cc = city.cityConstructions
-        val cost = construction.getStatBuyCost(city, stat) ?: throw Reject("not_purchasable", "$name n'a pas de prix en ${stat.name}")
+        val cost = construction.getStatBuyCost(city, stat) ?: throw OrderReject("not_purchasable", "$name n'a pas de prix en ${stat.name}")
         // purchaseConstruction checks neither the reserve nor the eligibility: this is the game's "one true test"
         if (!cc.isConstructionPurchaseAllowed(construction, stat, cost)) throw purchaseRejection(city, construction, stat, cost)
         val reserveBefore = city.getStatReserve(stat)
         val queueIndex = cc.constructionQueue.indexOf(name) // buying a queued item removes its entry, like the UI
-        if (!cc.purchaseConstruction(construction, queueIndex, automatic = true, stat = stat)) throw Reject("purchase_failed", name)
+        if (!cc.purchaseConstruction(construction, queueIndex, automatic = true, stat = stat)) throw OrderReject("purchase_failed", name)
         context.touched += city
         context.record(AppliedOrder.Purchase(id, city.id, name, stat.name))
         return "$name acheté à ${city.name} pour $cost ${stat.name} (réserve $reserveBefore -> ${city.getStatReserve(stat)})"
@@ -339,22 +337,22 @@ object OrdersApplier {
 
     /** Same order as `CityConstructions.isConstructionPurchaseAllowed`, to give the reason */
     @Suppress("DEPRECATION") // City.getMatchingUniques: the form used by isConstructionPurchaseAllowed itself
-    private fun purchaseRejection(city: City, construction: INonPerpetualConstruction, stat: Stat, cost: Int): Reject {
+    private fun purchaseRejection(city: City, construction: INonPerpetualConstruction, stat: Stat, cost: Int): OrderReject {
         val name = construction.name
         return when {
-            city.isPuppet && !city.getMatchingUniques(UniqueType.MayBuyConstructionsInPuppets).any() -> Reject("city_is_puppet", city.name)
-            city.isInResistance() -> Reject("city_in_resistance", city.name)
-            !construction.isPurchasable(city.cityConstructions) -> Reject("cannot_build", rejectionDetail(construction, city.cityConstructions))
-            construction is BaseUnit && !city.canPlaceNewUnit(construction) -> Reject("no_space_for_unit", "case centrale de ${city.name} occupée")
-            !construction.canBePurchasedWithStat(city, stat) -> Reject("not_purchasable", "$name ne s'achète pas en ${stat.name}")
-            else -> Reject(if (stat == Stat.Gold) "not_enough_gold" else "not_enough_faith",
+            city.isPuppet && !city.getMatchingUniques(UniqueType.MayBuyConstructionsInPuppets).any() -> OrderReject("city_is_puppet", city.name)
+            city.isInResistance() -> OrderReject("city_in_resistance", city.name)
+            !construction.isPurchasable(city.cityConstructions) -> OrderReject("cannot_build", rejectionDetail(construction, city.cityConstructions))
+            construction is BaseUnit && !city.canPlaceNewUnit(construction) -> OrderReject("no_space_for_unit", "case centrale de ${city.name} occupée")
+            !construction.canBePurchasedWithStat(city, stat) -> OrderReject("not_purchasable", "$name ne s'achète pas en ${stat.name}")
+            else -> OrderReject(if (stat == Stat.Gold) "not_enough_gold" else "not_enough_faith",
                 "$name coûte $cost ${stat.name}, réserve ${city.getStatReserve(stat)}")
         }
     }
 
     /** Same two lines as CivView.tryDisableCivConstruction / tryEnableCivConstruction (no view method, CLAUDE.md §6) */
     private fun toggleConstruction(context: Context, id: String, name: String, disable: Boolean): String {
-        if (resolve(context.civ, name) !is INonPerpetualConstruction) throw Reject("unknown_construction", name)
+        if (resolve(context.civ, name) !is INonPerpetualConstruction) throw OrderReject("unknown_construction", name)
         val civ = context.civ
         val changed = if (disable) civ.disabledCityConstructions.add(name) else civ.disabledCityConstructions.remove(name)
         for (city in civ.cities) {
@@ -364,26 +362,6 @@ object OrdersApplier {
         val state = if (disable) "$name désactivée dans toutes les villes (le pont la retire des files : l'IA native ignore ce drapeau)"
             else "$name réactivée"
         return if (changed) state else "$state ; déjà dans cet état"
-    }
-
-    // endregion
-    // region JSON helpers (JsonNull is a JsonPrimitive: test it first)
-
-    private fun JsonObject.str(key: String): String? =
-        (this[key] as? JsonPrimitive)?.takeIf { it !is JsonNull && it.isString }?.content
-
-    private fun JsonObject.reqStr(key: String): String = when (val value = this[key]) {
-        null, JsonNull -> throw Reject("missing_field", key)
-        is JsonPrimitive -> if (value.isString) value.content else throw Reject("invalid_field", key)
-        else -> throw Reject("invalid_field", key)
-    }
-
-    private fun JsonObject.reqStrList(key: String): List<String> = when (val value = this[key]) {
-        null, JsonNull -> throw Reject("missing_field", key)
-        is JsonArray -> value.map { element ->
-            (element as? JsonPrimitive)?.takeIf { it !is JsonNull && it.isString }?.content ?: throw Reject("invalid_field", key)
-        }
-        else -> throw Reject("invalid_field", key)
     }
 
     // endregion

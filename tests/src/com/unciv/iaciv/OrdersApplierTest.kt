@@ -293,7 +293,7 @@ class OrdersApplierTest {
         val results = apply(
             order("teleport_capital", "target" to "capital"),
             order(null),
-            order("declare_war", "target" to "France"),
+            order("set_posture", "posture" to "defensive"), // M3b
             noId,
             order("set_research_goal", "tech" to "Writing"),
         ).results

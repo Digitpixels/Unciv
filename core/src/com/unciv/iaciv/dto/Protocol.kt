@@ -58,6 +58,8 @@ data class SessionRequest(
     val players: List<PlayerDto>,
     val partieDir: String,
     val resumedFromSave: String?,
+    /** M3 §6 (compatible addition): `diplomacy_watch`, `display`, `pending_hold` */
+    val bridgeCapabilities: List<String> = listOf(),
 )
 
 @Serializable
@@ -197,16 +199,36 @@ data class DiplomacyDto(
     val theirEra: String,
     val theirCitiesKnown: List<KnownCityDto>,
     val flags: List<String>,
+    /** M3: turns since the war started (null if not at war; a lower bound if it started before the bridge did) */
+    val atWarSinceTurns: Int? = null,
+    /** M3: 0 = peace may be proposed now, N = in N turns (`peace_rule`), null if not at war */
+    val peacePossibleIn: Int? = null,
+    val weDenounced: Boolean = false,
+    val theyDenounced: Boolean = false,
+    val friendship: Boolean = false,
+    val defensivePact: Boolean = false,
 )
 
 @Serializable
-data class CityStateDto(val civId: String, val influence: Int, val ally: String?, val type: String)
+data class CityStateDto(
+    val civId: String,
+    val influence: Int,
+    val ally: String?,
+    val type: String,
+    /** M3 */
+    val atWar: Boolean = false,
+)
 
 @Serializable
 data class WorldDto(val wondersBuiltKnown: List<String>, val civsAlive: Int)
 
 @Serializable
-data class PendingDto(val tradeRequests: List<TradeRequestDto>, val popupAlerts: List<PopupAlertDto>)
+data class PendingDto(
+    val tradeRequests: List<TradeRequestDto>,
+    val popupAlerts: List<PopupAlertDto>,
+    /** M3: our offers still waiting at the other civs */
+    val outgoing: List<OutgoingOfferDto> = listOf(),
+)
 
 @Serializable
 data class TradeOfferDto(val type: String, val name: String, val amount: Int, val duration: Int)
@@ -219,21 +241,56 @@ data class TradeRequestDto(
     val weGive: List<TradeOfferDto>,
     val isPeaceTreaty: Boolean,
     val valid: Boolean,
+    /** M3: turns since our first turn-start that showed it */
+    val ageTurns: Int = 0,
+    /** M3: turns before the bridge refuses it (`pending_hold_turns`) */
+    val expiresIn: Int? = null,
+    /** M3: request_id of our own offer if this is a counter-proposal to it */
+    val counterTo: String? = null,
 )
 
+/** `alert_id` = `PA-<AlertType>-<value>` (M3), stable from one turn to the next */
 @Serializable
-data class PopupAlertDto(val alertId: String, val type: String, val value: String)
+data class PopupAlertDto(
+    val alertId: String,
+    val type: String,
+    val value: String,
+    val ageTurns: Int = 0,
+    /** null if not actionable */
+    val expiresIn: Int? = null,
+    /** friendship offer or demand: needs an answer (`respond_friendship` / `respond_demand`) */
+    val actionable: Boolean = false,
+    /** name of the `Demand` enum if this is a demand */
+    val demand: String? = null,
+)
+
+/** M3: an offer of ours waiting at [to]; [requestId] is the id the target sees (`TR-…` or `PA-…`) */
+@Serializable
+data class OutgoingOfferDto(val requestId: String, val to: String, val kind: String, val ageTurns: Int)
+
+/** M3 `legal_options.tradable`: one tradable offer (amount > 0); for a city `name` = city id and `label` = "name (pop N)" */
+@Serializable
+data class OfferOptionDto(val type: String, val name: String, val amountMax: Int, val duration: Int, val label: String)
+
+@Serializable
+data class TradableDto(val ours: List<OfferOptionDto>, val theirs: List<OfferOptionDto>)
 
 @Serializable
 data class LegalOptionsDto(
     val techs: List<String>,
     val policiesAdoptable: List<String>,
     val perCityConstructions: Map<String, List<String>>,
+    /** M3: known major civs and city-states */
     val canDeclareWarOn: List<String>,
     val canOfferFriendshipTo: List<String>,
+    /** M3: at war with us and past the `peace_rule` delay */
     val canProposePeaceTo: List<String>,
-    /** Filled in M3 (trades) */
-    val tradable: Map<String, JsonObject> = mapOf(),
+    /** M3: what the trade screen would show, per known living major civ */
+    val tradable: Map<String, TradableDto> = mapOf(),
+    /** M3 */
+    val canDenounce: List<String> = listOf(),
+    /** M3: `{civ_id: ["DoNotSettleNearUs", …]}` = demands we can make now */
+    val demandsAvailable: Map<String, List<String>> = mapOf(),
 )
 
 // endregion
@@ -274,10 +331,25 @@ data class OrderResultDto(
     val detail: String? = null,
     /** Only for `set_production_queue` (one entry per requested item, in the order received) */
     val itemResults: List<ItemResultDto>? = null,
+    /** M3: id of the offer as its target sees it (`propose_peace`, `propose_trade`, `respond_trade` counter) */
+    val requestId: String? = null,
 )
 
 @Serializable
 data class FallbackDto(val reason: String, val detail: String? = null)
+
+/** M3 §5: result of one `display[]` item. status `shown` | `rejected`; reason `unknown_kind` | `missing_field` |
+ *  `unknown_civ` | `empty_text` | `no_viewer` | `exception`; [shownText] = exact text stored in the notification */
+@Serializable
+data class DisplayResultDto(
+    val index: Int,
+    val kind: String,
+    val messageId: String? = null,
+    val status: String,
+    val reason: String? = null,
+    val shownText: String? = null,
+    val truncated: Boolean = false,
+)
 
 @Serializable
 data class TurnEndRequest(
@@ -290,6 +362,8 @@ data class TurnEndRequest(
     val results: List<OrderResultDto>,
     val fallback: FallbackDto?,
     val timingMs: Map<String, Long>,
+    /** M3 §5 */
+    val displayResults: List<DisplayResultDto> = listOf(),
 )
 
 @Serializable

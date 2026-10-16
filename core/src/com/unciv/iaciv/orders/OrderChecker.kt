@@ -1,5 +1,6 @@
 package com.unciv.iaciv.orders
 
+import com.unciv.iaciv.diplomacy.DiplomacyContext
 import com.unciv.logic.city.City
 import com.unciv.logic.civilization.Civilization
 import com.unciv.ui.screens.victoryscreen.RankingType
@@ -97,12 +98,13 @@ object OrderChecker {
         civ: Civilization,
         pending: PendingCheck,
         enforceDisabled: (Civilization) -> StandingOrders.DisabledEnforcement = StandingOrders::enforceDisabled,
+        diplomacy: DiplomacyContext = DiplomacyContext(),
     ): Verification {
         val newUnits = civ.units.getCivUnits().filter { it.id !in pending.unitIds }.map { it.baseUnit.name }.toMutableList()
         val checks = HashMap<AppliedOrder, OrderCheck>()
         for (order in pending.orders) {
             if (order is AppliedOrder.Toggle) continue
-            checks[order] = checkOne(civ, pending, order, newUnits)
+            checks[order] = superseded(order) ?: DiplomacyChecks.check(civ, order, diplomacy) ?: checkOne(civ, pending, order, newUnits)
         }
         val enforcement = enforceDisabled(civ)
         for (order in pending.orders.filterIsInstance<AppliedOrder.Toggle>())
@@ -148,6 +150,7 @@ object OrderChecker {
             }
             is AppliedOrder.Queue -> checkQueue(civ, pending, order, newUnits)
             is AppliedOrder.Toggle, is AppliedOrder.Noop -> result(NOT_CHECKED) // not reached: handled by verify / capture
+            else -> result(NOT_CHECKED) // diplomatic orders: handled by DiplomacyChecks
         }
     }
 

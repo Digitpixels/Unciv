@@ -1,19 +1,20 @@
 package com.unciv.iaciv.observe
 
+import com.unciv.iaciv.diplomacy.DiplomacyContext
+import com.unciv.iaciv.diplomacy.DiplomacyIds
+import com.unciv.iaciv.diplomacy.PendingHold
+import com.unciv.iaciv.dto.OutgoingOfferDto
 import com.unciv.iaciv.dto.PendingDto
 import com.unciv.iaciv.dto.PopupAlertDto
 import com.unciv.iaciv.dto.TradeOfferDto
 import com.unciv.iaciv.dto.TradeRequestDto
-import com.unciv.iaciv.dto.iaCivJson
 import com.unciv.logic.civilization.AlertType
 import com.unciv.logic.civilization.Civilization
+import com.unciv.logic.civilization.PopupAlert
 import com.unciv.logic.trade.TradeEvaluation
-import com.unciv.logic.trade.TradeOffersList
-import kotlinx.serialization.builtins.ListSerializer
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
-import java.security.MessageDigest
 
 /**
  * What a civ remembers between two turn-starts: identifiers and names only, never game objects
@@ -47,49 +48,102 @@ data class CivSnapshot(
 
 object EventCollector {
 
-    /** Offers and alerts waiting for an answer from [civ] (read BEFORE NextTurnAutomation answers and clears them) */
-    fun pending(civ: Civilization): PendingDto {
-        val trades = civ.tradeRequests.map { request ->
+    /**
+     * Offers and alerts waiting for an answer from [civ] (read BEFORE NextTurnAutomation answers and clears them),
+     * and our own offers waiting at the other civs (contract M3 §3). Ages come from [ctx]'s hold (first turn-start of
+     * [civ] that showed the item) and, for our offers, from the watcher (first time seen at the target).
+     */
+    fun pending(civ: Civilization, ctx: DiplomacyContext = DiplomacyContext()): PendingDto {
+        val turn = civ.gameInfo.turns
+        val hold = ctx.hold
+        val seenRequests = HashSet<String>()
+        val trades = civ.tradeRequests.mapNotNull { request ->
             val from = civ.gameInfo.getCivilization(request.requestingCiv)
-            val theyGive = offers(request.trade.theirOffers)
-            val weGive = offers(request.trade.ourOffers)
+            val theyGive = DiplomacyIds.offers(request.trade.theirOffers)
+            val weGive = DiplomacyIds.offers(request.trade.ourOffers)
+            val id = DiplomacyIds.tradeRequestId(request.requestingCiv, theyGive, weGive)
+            if (!seenRequests.add(id)) return@mapNotNull null
             TradeRequestDto(
-                requestId = tradeRequestId(request.requestingCiv, theyGive, weGive),
+                requestId = id,
                 from = request.requestingCiv,
                 theyGive = theyGive,
                 weGive = weGive,
                 isPeaceTreaty = request.trade.isPeaceTreaty(),
-                valid = TradeEvaluation().isTradeValid(request.trade, civ, from),
+                valid = civ.getDiplomacyManager(from) != null && TradeEvaluation().isTradeValid(request.trade, civ, from),
+                ageTurns = hold?.age(civ.civID, id, turn) ?: 0,
+                expiresIn = (ctx.pendingHoldTurns - (hold?.age(civ.civID, id, turn) ?: 0)).coerceAtLeast(0),
+                counterTo = ctx.watch?.counterTo(id),
             )
         }
+        val seenAlerts = HashSet<String>()
+        val alerts = civ.popupAlerts.mapNotNull { alert ->
+            val id = DiplomacyIds.alertId(alert)
+            if (!seenAlerts.add(id)) return@mapNotNull null
+            val actionable = DiplomacyIds.isActionable(alert.type)
+            val age = hold?.age(civ.civID, id, turn) ?: 0
+            PopupAlertDto(
+                alertId = id,
+                type = alert.type.name,
+                value = alert.value,
+                ageTurns = age,
+                expiresIn = if (actionable) (ctx.pendingHoldTurns - age).coerceAtLeast(0) else null,
+                actionable = actionable,
+                demand = DiplomacyIds.demandOf(alert.type)?.name,
+            )
+        }
+        return PendingDto(trades, alerts, outgoing(civ, ctx))
+    }
+
+    /** Our offers still waiting at the other civs: trade and peace requests, friendship offers, demands */
+    private fun outgoing(civ: Civilization, ctx: DiplomacyContext): List<OutgoingOfferDto> {
         val turn = civ.gameInfo.turns
-        val alerts = civ.popupAlerts.mapIndexed { index, alert -> PopupAlertDto("PA-$turn-$index", alert.type.name, alert.value) }
-        return PendingDto(trades, alerts)
+        val result = ArrayList<OutgoingOfferDto>()
+        for (other in civ.gameInfo.civilizations) {
+            if (other == civ || !DiplomacyIds.isPlayerCiv(other) || other.isDefeated()) continue
+            for ((id, request) in ctx.requestsOf(other)) {
+                if (request.requestingCiv != civ.civID) continue
+                val kind = if (request.trade.isPeaceTreaty()) "peace" else "trade"
+                result += OutgoingOfferDto(id, other.civID, kind, ctx.watch?.ageOf(other.civID, id, turn) ?: 0)
+            }
+            for ((type, value) in ctx.alertsOf(other).distinct()) {
+                if (value != civ.civID) continue
+                val kind = when {
+                    type == AlertType.DeclarationOfFriendship -> "friendship"
+                    DiplomacyIds.demandOf(type) != null -> "demand"
+                    else -> continue
+                }
+                val id = DiplomacyIds.alertId(type, value)
+                result += OutgoingOfferDto(id, other.civID, kind, ctx.watch?.ageOf(other.civID, id, turn) ?: 0)
+            }
+        }
+        return result
     }
 
-    /**
-     * `TradeRequest` has no id in Unciv: `TR-<requestingCiv>-<8 hex of SHA-1 of the offers' JSON>` (contract §1),
-     * stable as long as the offer does not change.
-     */
-    fun tradeRequestId(from: String, theyGive: List<TradeOfferDto>, weGive: List<TradeOfferDto>): String {
-        val serializer = ListSerializer(TradeOfferDto.serializer())
-        val canonical = iaCivJson.encodeToString(serializer, theyGive) + "|" + iaCivJson.encodeToString(serializer, weGive)
-        val digest = MessageDigest.getInstance("SHA-1").digest(canonical.toByteArray(Charsets.UTF_8))
-        return "TR-$from-" + digest.take(4).joinToString("") { "%02x".format(it) }
-    }
-
-    private fun offers(list: TradeOffersList) = list.map { TradeOfferDto(it.type.name, it.name, it.amount, it.duration) }
+    /** See [DiplomacyIds.tradeRequestId] */
+    fun tradeRequestId(from: String, theyGive: List<TradeOfferDto>, weGive: List<TradeOfferDto>): String =
+        DiplomacyIds.tradeRequestId(from, theyGive, weGive)
 
     /** Alerts already covered by the snapshot diff ([eventsSince]): not repeated as events */
     private val alertsCoveredByDiff = setOf(AlertType.FirstContact, AlertType.TechResearched, AlertType.GoldenAge)
 
     /**
      * Events derived from the popup alerts addressed to [civ] (they are consumed by the native AI right after H1),
-     * skipping the first [from] alerts (used for the alerts created while the orders are applied).
+     * skipping the first [from] alerts (used for the alerts created while the orders are applied). An actionable alert
+     * kept by the bridge's hold comes back every turn: it is reported only the first turn [civ] sees it ([hold]).
      */
-    fun eventsFromPopupAlerts(civ: Civilization, from: Int = 0): List<JsonObject> {
+    fun eventsFromPopupAlerts(civ: Civilization, from: Int = 0, hold: PendingHold? = null): List<JsonObject> =
+        eventsFromAlerts(civ, civ.popupAlerts.drop(from), hold)
+
+    /** Same as [eventsFromPopupAlerts] for the alerts of [civ] not in [before] (compared by identity) */
+    fun eventsFromNewAlerts(civ: Civilization, before: List<PopupAlert>, hold: PendingHold? = null): List<JsonObject> =
+        eventsFromAlerts(civ, civ.popupAlerts.filter { alert -> before.none { it === alert } }, hold)
+
+    private fun eventsFromAlerts(civ: Civilization, alerts: List<PopupAlert>, hold: PendingHold?): List<JsonObject> {
         val turn = civ.gameInfo.turns
-        return civ.popupAlerts.drop(from).filter { it.type !in alertsCoveredByDiff }.map { alert ->
+        return alerts.filter { it.type !in alertsCoveredByDiff }
+            .filter { hold == null || !DiplomacyIds.isActionable(it.type) || hold.age(civ.civID, DiplomacyIds.alertId(it), turn) == 0 }
+            .distinctBy { DiplomacyIds.alertId(it) }
+            .map { alert ->
             val type = when (alert.type) {
                 AlertType.WarDeclaration -> "war_declared_on_us"
                 AlertType.DeclarationOfFriendship -> "friendship_offered"

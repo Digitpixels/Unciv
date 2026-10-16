@@ -49,6 +49,7 @@ object NextTurnAutomation {
         TradeAutomation.respondToTradeRequests(civInfo, tradeAndChangeState)
 
         if (tradeAndChangeState && civInfo.isMajorCiv()) {
+            if (!com.unciv.iaciv.IaCivHooks.ownsDiplomacy(civInfo)) { // IA-Civ hook (H2)
             if (!civInfo.gameInfo.ruleset.modOptions.hasUnique(UniqueType.DiplomaticRelationshipsCannotChange)) {
                 DiplomacyAutomation.declareWar(civView)
                 DiplomacyAutomation.offerPeaceTreaty(civInfo)
@@ -68,6 +69,7 @@ object NextTurnAutomation {
             TradeAutomation.exchangeLuxuries(civInfo)
             
             issueRequests(civInfo)
+            } else if (civView.isReligionEnabled()) ReligionAutomation.spendFaithOnReligion(civInfo) // IA-Civ hook (H2)
             adoptPolicy(civInfo)  // todo can take a second - why?
             freeUpSpaceResources(civInfo)
         } else if (civInfo.isCityState) {

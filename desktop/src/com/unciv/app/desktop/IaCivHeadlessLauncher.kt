@@ -104,7 +104,23 @@ internal object IaCivHeadlessLauncher {
             type = setup.mapType
             setup.mapSeed?.let { seed = it }
         }
-        return GameStarter.startNewGame(GameSetupInfo(parameters, mapParameters))
+        val gameInfo = GameStarter.startNewGame(GameSetupInfo(parameters, mapParameters))
+        if (setup.rencontreInitiale) meetAllMajors(gameInfo)
+        return gameInfo
+    }
+
+    /** `partie.rencontre_initiale`: every pair of major civs meets before the first turn (test scenarios, contract M3 §8) */
+    private fun meetAllMajors(gameInfo: GameInfo) {
+        val majors = gameInfo.civilizations.filter { it.isMajorCiv() && !it.isSpectator() && !it.isBarbarian }
+        val met = ArrayList<String>()
+        for ((index, civ) in majors.withIndex()) {
+            for (other in majors.drop(index + 1)) {
+                if (civ.knows(other)) continue
+                civ.diplomacyFunctions.makeCivilizationsMeet(other)
+                met += "${civ.civID}-${other.civID}"
+            }
+        }
+        println("[IA-Civ] Rencontre initiale : ${met.ifEmpty { listOf("aucune paire nouvelle") }.joinToString(", ")}")
     }
 
     private fun parseArgs(args: Array<String>): Map<String, String> {

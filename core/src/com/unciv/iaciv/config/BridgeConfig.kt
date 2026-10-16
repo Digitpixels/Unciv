@@ -26,6 +26,17 @@ data class BridgeConfig(
     val turnEndTimeoutS: Int = 10,
     val eventsTimeoutS: Int = 5,
     val disabled: Boolean = false,
+    /**
+     * M3 §2: offers and actionable alerts an LLM civ did not answer are held by the bridge, then refused explicitly
+     * once they are this many turns old (counted from the civ's first turn-start that showed them). Provisional default.
+     */
+    val pendingHoldTurns: Int = 2,
+    /**
+     * M3 §4 `propose_peace`: "ui" = the rule of the game's peace button (no peace offer while the target still has the
+     * `DeclaredWar` flag towards us, i.e. 10 turns after a declaration), "none" = the hard game rules only. Provisional default.
+     */
+    val peaceRule: String = PEACE_RULE_UI,
+    val diplomacyWatch: DiplomacyWatchConfig = DiplomacyWatchConfig(),
     /** New-game setup, read only by the headless launcher */
     val partie: PartieSetup = PartieSetup(),
 ) {
@@ -34,6 +45,8 @@ data class BridgeConfig(
         const val ENV_ORCH_URL = "IACIV_ORCH_URL"
         const val ENV_DISABLED = "IACIV_DISABLED"
         const val PROPERTY_CONFIG = "iaciv.config"
+        const val PEACE_RULE_UI = "ui"
+        const val PEACE_RULE_NONE = "none"
 
         fun findConfigFile(explicitPath: String?): File? {
             val path = explicitPath
@@ -72,4 +85,16 @@ data class PartieSetup(
     val numberOfCityStates: Int = 0,
     val noBarbarians: Boolean = true,
     val maxTurns: Int = 100,
+    /** Test helper: every pair of major civs meets at the start of a new game (no waiting for the first contact) */
+    val rencontreInitiale: Boolean = false,
+)
+
+/** M3 §6: which events between two native civs the global watcher reports */
+@Serializable
+data class DiplomacyWatchConfig(
+    /**
+     * "major_only" (default): war, peace, friendship, denunciation and defensive pacts between major civs, plus wars
+     * and ally changes of the city-states; "all": every event; "none": only events involving an LLM civ.
+     */
+    val nativePairs: String = "major_only",
 )
