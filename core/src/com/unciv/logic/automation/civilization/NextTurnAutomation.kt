@@ -99,6 +99,7 @@ object NextTurnAutomation {
         if (tradeAndChangeState) trainSettler(civInfo)
         // I'm not sure what will happen if we *don't* vote when we can, so automate vote even when forced automation
         tryVoteForDiplomaticVictory(civInfo)
+        com.unciv.iaciv.IaCivHooks.onAiTurnEnd(civInfo, tradeAndChangeState) // IA-Civ hook (H4)
     }
 
     fun automateGoldToSciencePercentage(civInfo: Civilization) {
@@ -607,6 +608,7 @@ object NextTurnAutomation {
     }
 
     private fun trainSettler(civInfo: Civilization) {
+        if (com.unciv.iaciv.IaCivHooks.ownsExpansion(civInfo)) return // IA-Civ hook (H5)
         val personality = civInfo.getPersonality()
         if (civInfo.isCityState) return
         if (civInfo.isOneCityChallenger()) return

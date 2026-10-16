@@ -6,6 +6,7 @@ import com.unciv.iaciv.dto.EventsRequest
 import com.unciv.iaciv.dto.FallbackDto
 import com.unciv.iaciv.dto.MapDto
 import com.unciv.iaciv.dto.OrderResultDto
+import com.unciv.iaciv.dto.OrdersResponse
 import com.unciv.iaciv.dto.PROTOCOL_VERSION
 import com.unciv.iaciv.dto.PlayerDto
 import com.unciv.iaciv.dto.SessionRequest
@@ -18,6 +19,12 @@ import com.unciv.iaciv.observe.CivSnapshot
 import com.unciv.iaciv.observe.EventCollector
 import com.unciv.iaciv.observe.LegalOptions
 import com.unciv.iaciv.observe.ObservationBuilder
+import com.unciv.iaciv.orders.AppliedOrder
+import com.unciv.iaciv.orders.OrderCheck
+import com.unciv.iaciv.orders.OrderChecker
+import com.unciv.iaciv.orders.OrdersApplier
+import com.unciv.iaciv.orders.PendingCheck
+import com.unciv.iaciv.orders.StandingOrders
 import com.unciv.iaciv.save.TurnSaver
 import com.unciv.logic.GameInfo
 import com.unciv.logic.civilization.Civilization
@@ -35,11 +42,12 @@ import java.time.Instant
  * Bridge state, shared by the hooks (JVM singleton — never serialized into GameInfo, see CLAUDE.md §5).
  * Keeps only identifiers between turns: in UI mode each turn runs on a clone of GameInfo.
  *
- * M1 scope: send the observation of each LLM-controlled civ, receive (but not yet apply) orders, fall back to the
- * native AI on any failure, write one save per turn.
+ * M1: send the observation of each LLM-controlled civ, fall back to the native AI on any failure, one save per turn.
+ * M2: apply the orders at H1 (OrdersApplier), re-apply the standing orders (focus, disabled constructions), and at H4
+ * check whether each applied order is still in place (`order_check` events).
  */
 object IaCivBridge {
-    const val BRIDGE_VERSION = "0.1.0-m1"
+    const val BRIDGE_VERSION = "0.2.0-m2"
 
     private var initialized = false
     var config: BridgeConfig? = null
@@ -57,6 +65,7 @@ object IaCivBridge {
     var resumedFromSave: String? = null
 
     private val civStates = HashMap<String, CivState>()
+    private val standingOrders = StandingOrders()
     private var sessionGameId: String? = null
     private var lastSessionAttempt: String? = null
     private var lastSavedTurn: String? = null
@@ -69,6 +78,10 @@ object IaCivBridge {
         var lastSnapshot: CivSnapshot? = null
         /** Popup-derived events not delivered yet (the native AI clears the popups right after H1) */
         val carriedEvents = ArrayList<JsonObject>()
+        /** Orders applied at H1, compared with the game at H4 of the same turn (identifiers and names only) */
+        var pendingCheck: PendingCheck? = null
+        /** `{order_id, status, detail}` of the last H4 checks, sent back in the next `active_orders_status` */
+        var lastChecks: List<JsonObject> = listOf()
     }
 
     // region lifecycle
@@ -99,6 +112,18 @@ object IaCivBridge {
 
     fun isControlled(civ: Civilization): Boolean = isActive() && civ.civID in config!!.factions
 
+    /**
+     * H5: expansion belongs to the LLM courts — the native AI must not put a Settler at the head of their queues
+     * (decision of 16/10/2026). During a native pause after repeated fallbacks, the native AI is fully in charge again.
+     */
+    @Synchronized
+    fun ownsExpansion(civ: Civilization): Boolean {
+        init()
+        if (!isControlled(civ)) return false
+        val state = civStates[civ.civID] ?: return true
+        return civ.gameInfo.turns >= state.nativeUntilTurn
+    }
+
     @Synchronized
     fun shutdown() {
         client?.close()
@@ -122,6 +147,12 @@ object IaCivBridge {
         val orchestrator = client ?: return
         val turn = gameInfo.turns
         val state = civStates.getOrPut(civ.civID) { CivState() }
+        state.pendingCheck?.let { stale -> // H4 was never reached for these orders
+            state.pendingCheck = null
+            sendChecks(gameInfo, civ, stale.turn, OrderChecker.notChecked(stale, "fin du tour ${stale.turn} non atteinte par le pont (H4)"))
+        }
+        // Standing orders first (also during a pause): the native AI reset the focus at its turn start, before H1
+        applyStandingOrders(civ, turn, "H1")
         if (turn < state.nativeUntilTurn) {
             log.info("T$turn ${civ.civID} : natif (pause après des replis, jusqu'au tour ${state.nativeUntilTurn})")
             return
@@ -141,6 +172,7 @@ object IaCivBridge {
             pending = EventCollector.pending(civ),
             eventsSinceLast = state.carriedEvents + EventCollector.eventsSince(state.lastSnapshot, snapshot, civ),
             legalOptions = LegalOptions.build(civ),
+            activeOrdersStatus = standingOrders.statuses(civ) + state.lastChecks,
         )
         val body = iaCivJson.encodeToString(TurnStartRequest.serializer(), request)
         val observeMs = System.currentTimeMillis() - observeStart
@@ -167,15 +199,14 @@ object IaCivBridge {
                 state.consecutiveFallbacks = 0
                 state.lastSnapshot = snapshot
                 state.carriedEvents.clear()
-                // M1: orders are received but not applied (M2) — each one is reported as ignored
-                val results = response.orders.mapIndexed { index, order ->
-                    val id = (order["order_id"] as? JsonPrimitive)?.contentOrNull ?: "O-inconnu-$index"
-                    OrderResultDto(id, "ignored", "not_implemented", "application des ordres : jalon M2")
-                }
+                state.lastChecks = listOf()
                 log.info("T$turn ${civ.civID} : observation ${body.length / 1024} Ko (${observeMs} ms), " +
                     "réponse « ${response.mode} » avec ${response.orders.size} ordre(s) en $waitMs ms")
+                val applyStart = System.currentTimeMillis()
+                val results = applyOrders(civ, state, response, turn)
+                val applyTiming = timing + ("apply" to System.currentTimeMillis() - applyStart)
                 val turnEnd = TurnEndRequest(gameId = gameInfo.gameId, turn = turn, civId = civ.civID, decreeId = response.decreeId,
-                    mode = response.mode, results = results, fallback = null, timingMs = timing)
+                    mode = response.mode, results = results, fallback = null, timingMs = applyTiming)
                 (orchestrator.turnEnd(turnEnd, cfg.turnEndTimeoutS) as? Outcome.Failed)?.let {
                     log.warn("T$turn ${civ.civID} : turn-end non transmis (${it.reason} : ${it.detail})")
                 }
@@ -206,6 +237,105 @@ object IaCivBridge {
                 }
             }
         }
+    }
+
+    /**
+     * Applies the orders of [response] (M2) and prepares the H4 check. Orders of an earlier turn (a council that missed
+     * its deadline) are applied too if they are still legal: each order is validated against the current game.
+     */
+    private fun applyOrders(civ: Civilization, state: CivState, response: OrdersResponse, turn: Int): List<OrderResultDto> {
+        if (response.orders.isEmpty()) return listOf()
+        if (response.civId != null && response.civId != civ.civID) {
+            log.warn("T$turn ${civ.civID} : ordres adressés à ${response.civId}, tous rejetés")
+            return response.orders.mapIndexed { index, order ->
+                OrderResultDto(orderIdOf(order, index), "rejected", "wrong_civ", "ordres adressés à ${response.civId}")
+            }
+        }
+        if (response.turn != null && response.turn != turn)
+            log.info("T$turn ${civ.civID} : ordres du tour ${response.turn} appliqués au tour $turn s'ils sont encore légaux")
+        val alertsBefore = civ.popupAlerts.size
+        val outcome = OrdersApplier.apply(civ, response.orders) // never throws
+        try {
+            for (focus in outcome.applied.filterIsInstance<AppliedOrder.Focus>())
+                standingOrders.recordFocus(civ.civID, focus.cityId, focus.orderId, focus.focus, turn)
+            logEnforcement(civ, turn, "H1", StandingOrders.enforceDisabled(civ))
+            // alerts created by our own orders (golden age…) would be cleared by the native AI right after H1
+            state.carriedEvents += EventCollector.eventsFromPopupAlerts(civ, alertsBefore)
+            state.pendingCheck = OrderChecker.capture(civ, outcome.applied)
+        } catch (e: Exception) {
+            log.error("T$turn ${civ.civID} : suivi des ordres impossible (ordres permanents, contrôle de fin de tour)", e)
+        }
+
+        val results = outcome.results
+        for (result in results.filter { it.reason == "exception" })
+            log.error("T$turn ${civ.civID} : l'ordre ${result.orderId} a levé une exception : ${result.detail}")
+        val byStatus = results.groupingBy { it.status }.eachCount()
+        val reasons = results.filter { it.status == "rejected" }.groupingBy { it.reason ?: "?" }.eachCount()
+        log.info("T$turn ${civ.civID} : ordres appliqués ${byStatus["applied"] ?: 0}, partiels ${byStatus["partial"] ?: 0}, " +
+            "rejetés ${byStatus["rejected"] ?: 0}${if (reasons.isEmpty()) "" else " $reasons"}, ignorés ${byStatus["ignored"] ?: 0}")
+        return results
+    }
+
+    private fun orderIdOf(order: JsonObject, index: Int) =
+        (order["order_id"] as? JsonPrimitive)?.contentOrNull ?: "O-inconnu-$index"
+
+    /** Standing focus + disabled constructions (see StandingOrders) */
+    private fun applyStandingOrders(civ: Civilization, turn: Int, hook: String) {
+        try {
+            val refocused = standingOrders.reapplyFocus(civ)
+            if (refocused.isNotEmpty()) log.info("T$turn ${civ.civID} : focus permanents réappliqués ($hook) : ${refocused.joinToString(", ")}")
+            logEnforcement(civ, turn, hook, StandingOrders.enforceDisabled(civ))
+        } catch (e: Exception) {
+            log.error("T$turn ${civ.civID} : ordres permanents non réappliqués ($hook)", e)
+        }
+    }
+
+    private fun logEnforcement(civ: Civilization, turn: Int, hook: String, enforcement: StandingOrders.DisabledEnforcement) {
+        if (enforcement.removed.isNotEmpty())
+            log.info("T$turn ${civ.civID} : constructions désactivées retirées des files ($hook) : ${enforcement.removed}")
+        if (enforcement.kept.isNotEmpty())
+            log.warn("T$turn ${civ.civID} : constructions désactivées laissées en file faute d'autre choix ($hook) : ${enforcement.kept}")
+    }
+
+    // endregion
+    // region H4
+
+    /** End of the civ's turn: compare with the state captured at H1, send one `order_check` per applied order */
+    @Synchronized
+    fun onAiTurnEnd(civ: Civilization) {
+        val cfg = config ?: return
+        if (cfg.disabled || civ.civID !in cfg.factions) return
+        val gameInfo = civ.gameInfo
+        val turn = gameInfo.turns
+        val state = civStates[civ.civID]
+        val pending = state?.pendingCheck
+        state?.pendingCheck = null
+        if (state == null || pending == null) { // fallback, pause, or nothing applied: only the standing orders
+            logEnforcement(civ, turn, "H4", StandingOrders.enforceDisabled(civ))
+            return
+        }
+        if (pending.gameId != gameInfo.gameId || pending.turn != turn) {
+            sendChecks(gameInfo, civ, pending.turn, OrderChecker.notChecked(pending, "fin de tour d'une autre partie ou d'un autre tour"))
+            logEnforcement(civ, turn, "H4", StandingOrders.enforceDisabled(civ))
+            return
+        }
+        val verification = OrderChecker.verify(civ, pending)
+        logEnforcement(civ, turn, "H4", verification.enforcement)
+        val checks = verification.checks
+        state.lastChecks = checks.map { it.toActiveStatus() }
+        sendChecks(gameInfo, civ, pending.turn, checks)
+        val byStatus = checks.groupingBy { it.status }.eachCount()
+        val overriddenBy = checks.mapNotNull { it.overriddenBy }.groupingBy { it }.eachCount()
+        log.info("T$turn ${civ.civID} : fin de tour, ordres en place ${byStatus[OrderChecker.IN_PLACE] ?: 0}, " +
+            "terminés ${byStatus[OrderChecker.COMPLETED] ?: 0}, défaits ${byStatus[OrderChecker.OVERRIDDEN] ?: 0}" +
+            (if (overriddenBy.isEmpty()) "" else " $overriddenBy") + ", non vérifiés ${byStatus[OrderChecker.NOT_CHECKED] ?: 0}")
+    }
+
+    /** `order_check` events: to the orchestrator, or to `journaux/bridge_events.jsonl` if it cannot be reached */
+    private fun sendChecks(gameInfo: GameInfo, civ: Civilization, appliedTurn: Int, checks: List<OrderCheck>) {
+        if (checks.isEmpty()) return
+        val events = checks.map { it.toEvent(civ.civID, appliedTurn) }
+        if (!postEvents(gameInfo, events)) for (event in events) localEvent(gameInfo, event)
     }
 
     // endregion
@@ -281,20 +411,23 @@ object IaCivBridge {
         postEvents(gameInfo, listOf(buildJsonObject { put("type", "save_written"); put("path", path) }))
     }
 
-    /** Fire-and-forget `/v1/events` (a failure is only logged) */
-    fun postEvents(gameInfo: GameInfo, events: List<JsonObject>) {
-        val cfg = config ?: return
-        if (cfg.disabled || events.isEmpty()) return
-        val orchestrator = client ?: return
+    /** `/v1/events` (a failure is only logged); returns true if the orchestrator accepted the events */
+    fun postEvents(gameInfo: GameInfo, events: List<JsonObject>): Boolean {
+        val cfg = config ?: return false
+        if (cfg.disabled || events.isEmpty()) return false
+        val orchestrator = client ?: return false
         val result = orchestrator.events(EventsRequest(gameId = gameInfo.gameId, turn = gameInfo.turns, events = events), cfg.eventsTimeoutS)
         if (result is Outcome.Failed) {
             // logged once per outage, not on every save
             if (!eventsFailing) log.warn("Événements non transmis (${result.reason}) à partir du tour ${gameInfo.turns} : ${events.map { it["type"] }}")
             eventsFailing = true
-        } else if (eventsFailing) {
+            return false
+        }
+        if (eventsFailing) {
             log.info("Événements de nouveau transmis à partir du tour ${gameInfo.turns}")
             eventsFailing = false
         }
+        return true
     }
 
     /** Local trace of bridge events, kept even when the orchestrator is down: `journaux/bridge_events.jsonl` */
@@ -316,15 +449,22 @@ object IaCivBridge {
 
     // endregion
 
+    /** Test helper: put [civId] in a native pause until [untilTurn] (as after max_consecutive_fallbacks) */
+    @Synchronized
+    fun startNativePauseForTests(civId: String, untilTurn: Int) {
+        civStates.getOrPut(civId) { CivState() }.nativeUntilTurn = untilTurn
+    }
+
     /** Test helper: forget everything (config, session, per-civ state) */
     @Synchronized
-    internal fun resetForTests() {
+    fun resetForTests() {
         shutdown()
         initialized = false
         config = null
         partieDir = null
         log = BridgeLog(null)
         civStates.clear()
+        standingOrders.clear()
         sessionGameId = null
         lastSessionAttempt = null
         lastSavedTurn = null

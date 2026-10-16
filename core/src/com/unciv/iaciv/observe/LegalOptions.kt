@@ -22,15 +22,17 @@ object LegalOptions {
         return LegalOptionsDto(
             techs = ruleset.technologies.values.filter { civ.tech.canBeResearched(it.name) }.map { it.name }.sorted(),
             policiesAdoptable = ruleset.policies.values.filter { civ.policies.isAdoptable(it) }.map { it.name }.sorted(),
+            // Internal ruleset names. Not listed: the constructions the civ disabled (the bridge rejects them, OrdersApplier)
+            // and "Nothing" (always buildable, but an idle city is never a sensible order)
             perCityConstructions = civ.cities.associate { city ->
                 val constructions = city.cityConstructions
                 val nonPerpetual = (constructions.getConstructableUnits() + constructions.getBuildableBuildings())
-                    .filter { constructions.canAddToQueue(it) }
+                    .filter { constructions.canAddToQueue(it) && it.name !in civ.disabledCityConstructions }
                     .map { it.name }
                     .sorted()
                     .toList()
                 val perpetual = PerpetualConstruction.perpetualConstructionsMap.values
-                    .filter { it.isBuildable(constructions) }
+                    .filter { it != PerpetualConstruction.Idle && it.isBuildable(constructions) }
                     .map { it.name }
                 city.id to nonPerpetual + perpetual
             },

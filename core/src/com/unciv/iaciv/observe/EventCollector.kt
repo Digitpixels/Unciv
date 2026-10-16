@@ -83,10 +83,13 @@ object EventCollector {
     /** Alerts already covered by the snapshot diff ([eventsSince]): not repeated as events */
     private val alertsCoveredByDiff = setOf(AlertType.FirstContact, AlertType.TechResearched, AlertType.GoldenAge)
 
-    /** Events derived from the popup alerts addressed to [civ] (they are consumed by the native AI right after H1) */
-    fun eventsFromPopupAlerts(civ: Civilization): List<JsonObject> {
+    /**
+     * Events derived from the popup alerts addressed to [civ] (they are consumed by the native AI right after H1),
+     * skipping the first [from] alerts (used for the alerts created while the orders are applied).
+     */
+    fun eventsFromPopupAlerts(civ: Civilization, from: Int = 0): List<JsonObject> {
         val turn = civ.gameInfo.turns
-        return civ.popupAlerts.filter { it.type !in alertsCoveredByDiff }.map { alert ->
+        return civ.popupAlerts.drop(from).filter { it.type !in alertsCoveredByDiff }.map { alert ->
             val type = when (alert.type) {
                 AlertType.WarDeclaration -> "war_declared_on_us"
                 AlertType.DeclarationOfFriendship -> "friendship_offered"

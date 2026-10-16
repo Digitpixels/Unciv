@@ -84,7 +84,7 @@ data class TurnStartRequest(
     /** Heterogeneous events (`turn`, `type` + type-specific fields), see EventCollector */
     val eventsSinceLast: List<JsonObject>,
     val legalOptions: LegalOptionsDto,
-    /** Filled from M2 on (order tracking) */
+    /** Standing city focuses and the `order_check` results of the previous turn: `{order_id, status, detail}` */
     val activeOrdersStatus: List<JsonObject> = listOf(),
 )
 
@@ -246,7 +246,7 @@ data class OrdersResponse(
     val civId: String? = null,
     val mode: String = "llm",
     val decreeId: String? = null,
-    /** Typed and applied from M2 on; in M1 every order is reported as ignored */
+    /** Kept as raw JSON: the bridge validates each order itself and rejects only the bad ones (OrdersApplier) */
     val orders: List<JsonObject> = listOf(),
     val native: JsonObject? = null,
     val display: List<JsonObject> = listOf(),
@@ -261,8 +261,20 @@ data class PendingResponse(
     val expectedWaitS: Int? = null,
 )
 
+/** Result of one item of a `set_production_queue` order: status `applied` | `rejected` */
 @Serializable
-data class OrderResultDto(val orderId: String, val status: String, val reason: String? = null, val detail: String? = null)
+data class ItemResultDto(val item: String, val status: String, val reason: String? = null, val detail: String? = null)
+
+/** Result of one order in `turn-end.results[]`: status `applied` | `partial` | `rejected` | `ignored` */
+@Serializable
+data class OrderResultDto(
+    val orderId: String,
+    val status: String,
+    val reason: String? = null,
+    val detail: String? = null,
+    /** Only for `set_production_queue` (one entry per requested item, in the order received) */
+    val itemResults: List<ItemResultDto>? = null,
+)
 
 @Serializable
 data class FallbackDto(val reason: String, val detail: String? = null)

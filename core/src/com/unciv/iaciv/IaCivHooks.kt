@@ -25,4 +25,37 @@ object IaCivHooks {
             Log.error("[IA-Civ] H1 failed for ${civInfo.civID}, native AI plays this turn", e)
         }
     }
+
+    /**
+     * H4 — last line of `NextTurnAutomation.automateCivMoves(civInfo)`, after `trainSettler` and the diplomatic vote:
+     * the last point where the native AI acts for this civ this turn. Measures whether the orders applied at H1 are
+     * still in place (`order_check` events) and re-enforces the disabled constructions. Same guard as H1.
+     */
+    @JvmStatic
+    fun onAiTurnEnd(civInfo: Civilization, tradeAndChangeState: Boolean) {
+        if (!tradeAndChangeState) return
+        try {
+            IaCivBridge.onAiTurnEnd(civInfo)
+        } catch (e: Exception) {
+            Log.error("[IA-Civ] H4 failed for ${civInfo.civID}", e)
+        } catch (e: LinkageError) {
+            Log.error("[IA-Civ] H4 failed for ${civInfo.civID}", e)
+        }
+    }
+
+    /**
+     * H5 — first line of `NextTurnAutomation.trainSettler(civInfo)`: true = skip it. For an LLM civ the native AI no
+     * longer replaces the head of a city queue with a Settler (it undid the courts' orders): only the LLM decides to
+     * expand. False when the bridge is inert, for other civs, during a native pause, and on any error.
+     */
+    @JvmStatic
+    fun ownsExpansion(civInfo: Civilization): Boolean = try {
+        IaCivBridge.ownsExpansion(civInfo)
+    } catch (e: Exception) {
+        Log.error("[IA-Civ] H5 failed for ${civInfo.civID}, native settler logic kept", e)
+        false
+    } catch (e: LinkageError) {
+        Log.error("[IA-Civ] H5 failed for ${civInfo.civID}, native settler logic kept", e)
+        false
+    }
 }
